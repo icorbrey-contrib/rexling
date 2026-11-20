@@ -1,6 +1,8 @@
 use anyhow::{Context, Result, bail, ensure};
 use futures_util::{Sink, Stream};
 use percent_encoding::percent_decode_str;
+#[cfg(feature = "iroh")]
+use std::sync::Arc;
 use std::time::Duration;
 use tokio_tungstenite::{
     client_async_with_config, connect_async_with_config,
@@ -28,18 +30,35 @@ impl<T> Socket for T where
 }
 pub type Ws = Box<dyn Socket>;
 
+/// The scheme of a Rex server reached through rex-iroh. Its host is the
+/// issuer's endpoint id as 64 lowercase hex digits.
+pub const IROH_SCHEME: &str = "rex-iroh";
+
 #[derive(Clone)]
 pub struct Endpoint {
     url: Url,
     pub timeout: Duration,
+
+    /// The iroh service `rex-iroh` endpoints dial through.
+    #[cfg(feature = "iroh")]
+    iroh: Option<Arc<crate::iroh::Service>>,
+}
+
+fn is_endpoint_id(host: &str) -> bool {
+    host.len() == 64 && host.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
 impl Endpoint {
     pub fn new(server: &str, timeout: Duration) -> Result<Self> {
         let url = Url::parse(server).context("use an explicit unix://, https://, http://, wss://, or ws:// URL (host labels are CLI-only)")?;
         ensure!(
-            matches!(url.scheme(), "unix" | "https" | "http" | "wss" | "ws" | "ssh"),
+            matches!(url.scheme(), "unix" | "https" | "http" | "wss" | "ws" | "ssh" | IROH_SCHEME),
             "unsupported server scheme"
+        );
+        #[cfg(not(feature = "iroh"))]
+        ensure!(
+            url.scheme() != IROH_SCHEME,
+            "rex-iroh endpoints need a build with the iroh feature"
         );
         ensure!(
             (url.username().is_empty() || url.scheme() == "ssh") && url.password().is_none(),
@@ -56,6 +75,15 @@ impl Endpoint {
             );
         } else if url.scheme() == "ssh" {
             ensure!(url.host_str().is_some() && !url.username().is_empty(), "SSH requires a host and username");
+        } else if url.scheme() == IROH_SCHEME {
+            ensure!(
+                url.port().is_none() && matches!(url.path(), "" | "/"),
+                "rex-iroh URL must be rex-iroh://<64 lowercase hex digits> with no port or path"
+            );
+            ensure!(
+                url.host_str().is_some_and(is_endpoint_id),
+                "rex-iroh host must be the issuer's endpoint id: 64 lowercase hex digits"
+            );
         } else {
             ensure!(
                 url.host_str().is_some() && matches!(url.path(), "" | "/"),
@@ -63,18 +91,31 @@ impl Endpoint {
             );
         }
         ensure!(!timeout.is_zero(), "timeout must be positive");
-        Ok(Self { url, timeout })
+        Ok(Self {
+            url,
+            timeout,
+            #[cfg(feature = "iroh")]
+            iroh: None,
+        })
+    }
+
+    /// Attach the iroh service that `rex-iroh` endpoints dial through.
+    #[cfg(feature = "iroh")]
+    pub fn with_iroh(mut self, service: Arc<crate::iroh::Service>) -> Self {
+        self.iroh = Some(service);
+        self
     }
 
     pub async fn open(&self, path: &str, protocol: &str) -> Result<Ws> {
         let unix = self.url.scheme() == "unix";
         let ssh = self.url.scheme() == "ssh";
-        let mut url = if unix || ssh {
+        let iroh = self.url.scheme() == IROH_SCHEME;
+        let mut url = if unix || ssh || iroh {
             Url::parse("ws://localhost")?
         } else {
             self.url.clone()
         };
-        if !unix && !ssh {
+        if !unix && !ssh && !iroh {
             let scheme = match url.scheme() {
                 "https" => "wss",
                 "http" => "ws",
@@ -110,6 +151,30 @@ impl Endpoint {
                 #[cfg(not(unix))]
                 {
                     bail!("Unix sockets are unsupported on this platform");
+                }
+            } else if iroh {
+                #[cfg(feature = "iroh")]
+                {
+                    let service = self
+                        .iroh
+                        .clone()
+                        .context("no iroh service is attached to this rex-iroh endpoint")?;
+                    let id = crate::iroh::parse_endpoint_id(self.url.host_str().unwrap_or_default())?;
+                    // No TLS here: the iroh connection already encrypts and authenticates.
+                    let stream = service.connect(id).await?;
+                    match client_async_with_config(request, stream, Some(config)).await {
+                        Ok((ws, response)) => (Box::new(ws), response),
+                        Err(error) => {
+                            if let Some(message) = service.refusal_for(id).await {
+                                bail!(message);
+                            }
+                            return Err(error.into());
+                        }
+                    }
+                }
+                #[cfg(not(feature = "iroh"))]
+                {
+                    bail!("rex-iroh endpoints need a build with the iroh feature");
                 }
             } else {
                 #[cfg(target_os = "android")]
@@ -181,5 +246,34 @@ mod tests {
         ] {
             assert!(Endpoint::new(url, Duration::from_secs(3)).is_err());
         }
+    }
+
+    #[test]
+    fn rex_iroh_needs_a_lowercase_endpoint_id_host() {
+        let id = "ab".repeat(32);
+        let accepted = Endpoint::new(&format!("{IROH_SCHEME}://{id}"), Duration::from_secs(3));
+        let uppercase = Endpoint::new(
+            &format!("{IROH_SCHEME}://{}", id.to_uppercase()),
+            Duration::from_secs(3),
+        );
+        let short = Endpoint::new(&format!("{IROH_SCHEME}://abcd"), Duration::from_secs(3));
+        let with_port = Endpoint::new(&format!("{IROH_SCHEME}://{id}:9"), Duration::from_secs(3));
+
+        assert_eq!(accepted.is_ok(), cfg!(feature = "iroh"));
+        assert!(uppercase.is_err());
+        assert!(short.is_err());
+        assert!(with_port.is_err());
+    }
+
+    #[cfg(not(feature = "iroh"))]
+    #[test]
+    fn rex_iroh_is_refused_without_the_iroh_feature() {
+        let error = Endpoint::new(
+            &format!("{IROH_SCHEME}://{}", "ab".repeat(32)),
+            Duration::from_secs(3),
+        )
+        .err()
+        .expect("rex-iroh is refused");
+        assert!(error.to_string().contains("iroh feature"), "{error}");
     }
 }

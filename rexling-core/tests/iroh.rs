@@ -23,15 +23,52 @@ use rex_iroh::{
     sas::Sas,
     tunnel::{ALPN, RexBridge},
 };
-use rexling_core::iroh::{Config, PairingState, Service};
+use rexling_core::{
+    iroh::{Config, PairingState, Service},
+    transport::{CONTROL, Endpoint as RexEndpoint, IROH_SCHEME},
+};
+use futures_util::{SinkExt, StreamExt};
+use tokio_tungstenite::tungstenite::Message;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
-    net::UnixListener,
+    net::{UnixListener, UnixStream},
 };
 
 /// A loopback port nothing listens on. Relay and lookup stay unreachable, so
 /// only the direct addresses in the issuer's ticket carry the dial.
 const UNREACHABLE: &str = "http://127.0.0.1:9/";
+
+/// Answers the control WebSocket handshake, then `pong:` to each text message.
+async fn serve_control(stream: UnixStream) {
+    use futures_util::{SinkExt, StreamExt};
+    use tokio_tungstenite::{
+        accept_hdr_async,
+        tungstenite::{
+            Message,
+            handshake::server::{Request, Response},
+        },
+    };
+
+    #[allow(clippy::result_large_err)]
+    let mut socket = accept_hdr_async(stream, |request: &Request, mut response: Response| {
+        assert_eq!(request.headers()["Sec-WebSocket-Protocol"], CONTROL);
+        response
+            .headers_mut()
+            .insert("Sec-WebSocket-Protocol", CONTROL.parse().unwrap());
+        Ok(response)
+    })
+    .await
+    .unwrap();
+
+    while let Some(Ok(message)) = socket.next().await {
+        if let Message::Text(text) = message {
+            socket
+                .send(Message::Text(format!("pong:{text}").into()))
+                .await
+                .ok();
+        }
+    }
+}
 
 async fn within<T>(what: &str, fut: impl std::future::Future<Output = T>) -> T {
     tokio::time::timeout(Duration::from_secs(20), fut)
@@ -58,8 +95,22 @@ struct Issuer {
     _dir: tempfile::TempDir,
 }
 
+/// What the stub Rex socket speaks.
+#[derive(Clone, Copy)]
+enum Rex {
+    /// Raw bytes: each connection's request comes back after `echo:`.
+    Echo,
+
+    /// The control WebSocket: it answers each text message with `pong:`.
+    WebSocket,
+}
+
 impl Issuer {
     async fn start(allowed: &[EndpointId]) -> Self {
+        Self::start_as(allowed, Rex::Echo).await
+    }
+
+    async fn start_as(allowed: &[EndpointId], rex: Rex) -> Self {
         let dir = tempfile::tempdir().unwrap();
         let rex_socket = dir.path().join("rex.sock");
         let listener = UnixListener::bind(&rex_socket).unwrap();
@@ -67,11 +118,16 @@ impl Issuer {
             loop {
                 let (mut stream, _) = listener.accept().await.unwrap();
                 tokio::spawn(async move {
-                    let mut request = Vec::new();
-                    if stream.read_to_end(&mut request).await.is_ok() {
-                        stream.write_all(b"echo:").await.ok();
-                        stream.write_all(&request).await.ok();
-                        stream.shutdown().await.ok();
+                    match rex {
+                        Rex::Echo => {
+                            let mut request = Vec::new();
+                            if stream.read_to_end(&mut request).await.is_ok() {
+                                stream.write_all(b"echo:").await.ok();
+                                stream.write_all(&request).await.ok();
+                                stream.shutdown().await.ok();
+                            }
+                        }
+                        Rex::WebSocket => serve_control(stream).await,
                     }
                 });
             }
@@ -394,4 +450,73 @@ async fn an_unreadable_invite_is_refused_before_dialing() {
         panic!("a bad invite fails");
     };
     assert!(format!("{error:#}").contains("reading the invite"), "{error:#}");
+}
+
+/// A rexling `Endpoint` for `rex-iroh://<id>` on `service`.
+fn rex_endpoint(service: &Arc<Service>, id: EndpointId) -> RexEndpoint {
+    RexEndpoint::new(&format!("{IROH_SCHEME}://{id}"), Duration::from_secs(20))
+        .unwrap()
+        .with_iroh(service.clone())
+}
+
+#[tokio::test]
+async fn control_websocket_round_trips_through_the_issuer() {
+    let device = Device::new();
+    let issuer = Issuer::start_as(&[device.service.id()], Rex::WebSocket).await;
+    device.join(&issuer);
+
+    let reply = within("the control reply", async {
+        let mut socket = rex_endpoint(&device.service, issuer.endpoint.id())
+            .open("/", CONTROL)
+            .await
+            .unwrap();
+        socket.send(Message::Text("ping".into())).await.unwrap();
+        match socket.next().await.unwrap().unwrap() {
+            Message::Text(text) => text.to_string(),
+            other => panic!("unexpected frame: {other:?}"),
+        }
+    })
+    .await;
+
+    assert_eq!(reply, "pong:ping");
+}
+
+#[tokio::test]
+async fn endpoint_open_names_a_refused_device() {
+    let device = Device::new();
+    let issuer = Issuer::start_as(&[], Rex::WebSocket).await;
+    device.join(&issuer);
+
+    let error = within("the refusal", async {
+        let Err(error) = rex_endpoint(&device.service, issuer.endpoint.id())
+            .open("/", CONTROL)
+            .await
+        else {
+            panic!("a refused device cannot open the control socket");
+        };
+        error
+    })
+    .await;
+
+    assert!(
+        format!("{error:#}").contains("turned this device away"),
+        "unclear refusal: {error:#}"
+    );
+}
+
+#[tokio::test]
+async fn endpoint_open_names_an_unjoined_id() {
+    let device = Device::new();
+    let stranger = SecretKey::generate().public();
+
+    let error = rex_endpoint(&device.service, stranger)
+        .open("/", CONTROL)
+        .await
+        .err()
+        .expect("an unjoined id fails");
+
+    assert!(
+        format!("{error:#}").contains("no joined issuer has endpoint id"),
+        "unclear error: {error:#}"
+    );
 }

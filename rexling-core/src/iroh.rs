@@ -128,6 +128,16 @@ pub struct Service {
     next_pairing: std::sync::atomic::AtomicU64,
 }
 
+/// How long [`Service::refusal_for`] waits for a refusal to show up.
+const REFUSAL_CHECKS: u32 = 20;
+const REFUSAL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// Reads an endpoint id from its 64 lowercase hex digits.
+pub fn parse_endpoint_id(hex: &str) -> Result<EndpointId> {
+    hex.parse::<EndpointId>()
+        .with_context(|| format!("endpoint id {hex:?} is not 64 hex digits"))
+}
+
 /// Names a pairing started by [`Service::start_pairing`].
 pub type PairingId = u64;
 
@@ -183,6 +193,28 @@ impl Service {
     /// not be read. One unreadable file does not hide the others.
     pub fn issuers(&self) -> Result<Listing> {
         self.joined.list().context("reading joined issuers")
+    }
+
+    /// The message to show when issuer `id` turns this device away, if it
+    /// does. A refusal arrives as its connection closes, which can come just
+    /// after a handshake fails, so this waits briefly for it.
+    pub async fn refusal_for(&self, id: EndpointId) -> Option<String> {
+        for _ in 0..REFUSAL_CHECKS {
+            let refused = {
+                let dialers = self
+                    .dialers
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                dialers
+                    .get(&id)
+                    .and_then(|(_, dialer)| dialer.refusal())
+            };
+            if let Some(refused) = refused {
+                return Some(format!("issuer {id} turned this device away: {refused}"));
+            }
+            tokio::time::sleep(REFUSAL_INTERVAL).await;
+        }
+        None
     }
 
     /// Open a byte stream to the Rex socket behind issuer `id`.
