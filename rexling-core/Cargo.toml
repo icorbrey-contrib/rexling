@@ -28,3 +28,6 @@ url = "2.5"
 [workspace]
 members = [".", "jni", "probe"]
 resolver = "2"
+
+[patch.crates-io]
+rex-iroh = { path = "/Users/isaac_corbrey/.cache/jj-desks/rex-iroh/cli-feature" }
