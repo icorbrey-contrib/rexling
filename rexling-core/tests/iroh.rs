@@ -239,3 +239,50 @@ async fn a_device_off_the_allowlist_gets_no_reply() {
         "refused device got a reply: {reply:?}"
     );
 }
+
+#[tokio::test]
+async fn status_reports_idle_then_connected_then_refused() {
+    let device = Device::new();
+    let welcome = Issuer::start(&[device.service.id()]).await;
+    let refuser = Issuer::start(&[]).await;
+    device.join(&welcome);
+    device.join(&refuser);
+
+    let before = device.service.issuer_status().unwrap();
+    assert!(before.iter().all(|s| matches!(s.link, rex_iroh::status::LinkStatus::Idle)));
+
+    let mut stream = device.service.connect(welcome.endpoint.id()).await.unwrap();
+    stream.shutdown().await.ok();
+    let mut reply = Vec::new();
+    stream.read_to_end(&mut reply).await.ok();
+
+    let refused_id = refuser.endpoint.id();
+    device.service.connect(refused_id).await.ok();
+
+    within("the refusal to be recorded", async {
+        loop {
+            let status = device.service.issuer_status().unwrap();
+            let refused = status
+                .iter()
+                .find(|s| s.id == refused_id)
+                .and_then(|s| s.refused);
+            if refused.is_some() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await;
+
+    let status = device.service.issuer_status().unwrap();
+    let welcome_status = status.iter().find(|s| s.id == welcome.endpoint.id()).unwrap();
+    assert!(matches!(
+        welcome_status.link,
+        rex_iroh::status::LinkStatus::Connected { .. }
+    ));
+    let refused_status = status.iter().find(|s| s.id == refused_id).unwrap();
+    assert_eq!(
+        refused_status.refused,
+        Some(rex_iroh::tunnel::CloseReason::Denied)
+    );
+}

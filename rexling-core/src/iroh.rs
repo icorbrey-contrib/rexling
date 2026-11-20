@@ -16,7 +16,8 @@ use iroh::{Endpoint, EndpointAddr, EndpointId, RelayUrl, SecretKey};
 use rex_iroh::{
     joined::{Issuer, Joined, Listing},
     node::{Lookup, Network, Relays},
-    tunnel::{Dialer, splice},
+    status::LinkStatus,
+    tunnel::{CloseReason, Dialer, splice},
 };
 use tokio::net::UnixStream;
 use url::Url;
@@ -92,6 +93,17 @@ fn network(relays: &[String], address_lookup: Option<&str>) -> Result<Network> {
         relays: Relays::from_urls(relays),
         lookup,
     })
+}
+
+/// One joined issuer and how its connection stands. The link state keeps
+/// rex-iroh's serializable shape, so the app can encode it as JSON.
+pub struct IssuerStatus {
+    pub name: String,
+    pub id: EndpointId,
+    pub link: LinkStatus,
+
+    /// Set while the issuer turns this device away.
+    pub refused: Option<CloseReason>,
 }
 
 /// This device's identity, its network settings and the issuers it has
@@ -221,6 +233,38 @@ impl Service {
             })
             .await?;
         Ok(endpoint.clone())
+    }
+
+    /// Each joined issuer with its connection state. An issuer that has not
+    /// been dialed yet reports idle; the endpoint is not bound by this call.
+    pub fn issuer_status(&self) -> Result<Vec<IssuerStatus>> {
+        let dialers = self
+            .dialers
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+        Ok(self
+            .issuers()?
+            .issuers
+            .into_iter()
+            .map(|issuer| {
+                let id = issuer.id();
+                match dialers.get(&id) {
+                    Some((_, dialer)) => IssuerStatus {
+                        name: issuer.name.to_string(),
+                        id,
+                        link: dialer.link(),
+                        refused: dialer.refusal().map(|refused| refused.reason()),
+                    },
+                    None => IssuerStatus {
+                        name: issuer.name.to_string(),
+                        id,
+                        link: LinkStatus::Idle,
+                        refused: None,
+                    },
+                }
+            })
+            .collect())
     }
 
     /// The dialer for `issuer`, made on first use and reused after.
