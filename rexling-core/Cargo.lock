@@ -2677,6 +2677,7 @@ dependencies = [
  "futures-util",
  "getrandom 0.3.4",
  "iroh",
+ "iroh-tickets",
  "percent-encoding",
  "png",
  "rex-iroh",
