@@ -13,3 +13,6 @@ pub mod forward;
 
 #[cfg(target_os = "android")]
 pub mod network;
+
+#[cfg(feature = "iroh")]
+pub mod iroh;
