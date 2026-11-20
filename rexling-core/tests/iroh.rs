@@ -14,10 +14,16 @@ use iroh::{
 use iroh_tickets::endpoint::EndpointTicket;
 use rex_iroh::{
     allowlist,
+    invite::Invite,
     joined::Joined,
+    pair::{
+        ALPN as PAIR_ALPN, Approver, Decision, INVITE_LIFETIME, InviteStore, Outcome,
+        PairHandler, PairingRequest, Policy, SystemClock, Timeouts,
+    },
+    sas::Sas,
     tunnel::{ALPN, RexBridge},
 };
-use rexling_core::iroh::{Config, Service};
+use rexling_core::iroh::{Config, PairingState, Service};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::UnixListener,
@@ -285,4 +291,107 @@ async fn status_reports_idle_then_connected_then_refused() {
         refused_status.refused,
         Some(rex_iroh::tunnel::CloseReason::Denied)
     );
+}
+
+/// Holds the issuer's decision until the test sends one, so the test can
+/// read the words the joiner shows while the issuer is still deciding.
+#[derive(Debug)]
+struct Gate(std::sync::Mutex<Option<tokio::sync::oneshot::Receiver<Decision>>>);
+
+impl Approver for Gate {
+    async fn decide(&self, _request: &PairingRequest) -> Decision {
+        let decision = self.0.lock().unwrap().take().expect("one request");
+        decision.await.unwrap_or(Decision::NoAnswer)
+    }
+
+    fn finished(&self, _request: &PairingRequest, _outcome: &Outcome) {}
+}
+
+/// An issuer that answers pairing requests through `gate`, and mints one
+/// invite for them.
+async fn prompting_issuer(gate: Gate) -> (Endpoint, Router, Invite, PathBuf, tempfile::TempDir) {
+    let dir = tempfile::tempdir().unwrap();
+    let list = dir.path().join("allowlist");
+    let endpoint = loopback(SecretKey::generate()).await;
+    let store = Arc::new(InviteStore::new(Arc::new(SystemClock), INVITE_LIFETIME));
+    let secret = store.mint(Policy::Prompt, gate);
+    let pairing = PairHandler::new(
+        endpoint.id(),
+        store,
+        list.clone(),
+        Arc::new(SystemClock),
+        Timeouts::default(),
+    );
+    let router = Router::builder(endpoint.clone())
+        .accept(PAIR_ALPN, pairing)
+        .spawn();
+    let invite = Invite {
+        ticket: EndpointTicket::new(endpoint.addr()),
+        secret,
+    };
+    (endpoint, router, invite, list, dir)
+}
+
+/// Poll the device's pairing until `done` accepts its state.
+async fn pairing_until(
+    service: &Service,
+    id: u64,
+    done: impl Fn(&PairingState) -> bool,
+) -> PairingState {
+    within("the pairing state", async {
+        loop {
+            let state = service.pairing_state(id).unwrap();
+            if done(&state) {
+                return state;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+}
+
+#[tokio::test]
+async fn pairing_shows_the_words_then_saves_the_issuer_on_accept() {
+    let device = Device::new();
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let (issuer, _router, invite, list, _dir) =
+        prompting_issuer(Gate(std::sync::Mutex::new(Some(rx)))).await;
+
+    let text = invite.to_string();
+    let id = device.service.start_pairing(&text, Some("phone".into())).unwrap();
+
+    let waiting = pairing_until(&device.service, id, |s| {
+        matches!(s, PairingState::Waiting { .. })
+    })
+    .await;
+    let PairingState::Waiting { words, issuer: shown } = waiting else {
+        unreachable!("waited for Waiting")
+    };
+    assert_eq!(shown, issuer.id());
+    let expected = Sas::new(&invite.secret, &issuer.id(), &device.service.id()).words();
+    assert_eq!(words, expected);
+
+    tx.send(Decision::Accept).unwrap();
+    let accepted = pairing_until(&device.service, id, |s| {
+        !matches!(s, PairingState::Starting | PairingState::Waiting { .. })
+    })
+    .await;
+    assert!(matches!(accepted, PairingState::Accepted { .. }), "{accepted:?}");
+
+    let allowed = rex_iroh::allowlist::Allowlist::load(&list).unwrap();
+    assert!(allowed.contains(&device.service.id()));
+    let joined = device.service.issuers().unwrap();
+    assert!(joined.issuers.iter().any(|i| i.id() == issuer.id()));
+}
+
+#[tokio::test]
+async fn an_unreadable_invite_is_refused_before_dialing() {
+    let device = Device::new();
+    let Err(error) = device
+        .service
+        .start_pairing("rexpair:?ticket=nope&secret=nope", None)
+    else {
+        panic!("a bad invite fails");
+    };
+    assert!(format!("{error:#}").contains("reading the invite"), "{error:#}");
 }

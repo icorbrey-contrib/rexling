@@ -14,11 +14,14 @@ use std::{
 use anyhow::{Context, Result, anyhow};
 use iroh::{Endpoint, EndpointAddr, EndpointId, RelayUrl, SecretKey};
 use rex_iroh::{
-    joined::{Issuer, Joined, Listing},
+    invite::Invite,
+    joined::{Claim, Issuer, Joined, Listing},
     node::{Lookup, Network, Relays},
+    pair::{self, JoinError, Joining},
     status::LinkStatus,
     tunnel::{CloseReason, Dialer, splice},
 };
+use std::str::FromStr;
 use tokio::net::UnixStream;
 use url::Url;
 
@@ -120,6 +123,32 @@ pub struct Service {
     /// One dialer per issuer, kept with the address it dials, so a re-paired
     /// issuer with a new address gets a new dialer.
     dialers: Mutex<HashMap<EndpointId, (EndpointAddr, Arc<Dialer>)>>,
+
+    pairings: Mutex<HashMap<PairingId, Arc<Mutex<PairingState>>>>,
+    next_pairing: std::sync::atomic::AtomicU64,
+}
+
+/// Names a pairing started by [`Service::start_pairing`].
+pub type PairingId = u64;
+
+/// Where a pairing stands. The words are the five-word check the issuer
+/// shows too; the user compares them before the issuer approves.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PairingState {
+    /// Dialing the issuer and presenting the invite.
+    Starting,
+
+    /// The issuer is deciding. Show `words` so the user can compare them.
+    Waiting { words: [&'static str; 5], issuer: EndpointId },
+
+    /// The issuer accepted, and the issuer is saved under `name`.
+    Accepted { name: String },
+
+    /// The issuer turned the request down, with its reason if it gave one.
+    Rejected { reason: Option<String> },
+
+    /// Pairing failed before the issuer answered, or the answer could not be saved.
+    Failed { error: String },
 }
 
 impl Service {
@@ -140,6 +169,8 @@ impl Service {
             joined,
             endpoint: tokio::sync::OnceCell::new(),
             dialers: Mutex::new(HashMap::new()),
+            pairings: Mutex::new(HashMap::new()),
+            next_pairing: std::sync::atomic::AtomicU64::new(1),
         })
     }
 
@@ -233,6 +264,103 @@ impl Service {
             })
             .await?;
         Ok(endpoint.clone())
+    }
+
+    /// Start pairing with the issuer whose invite text is `invite`, in the
+    /// background. Poll [`Service::pairing_state`] for the outcome. `label`
+    /// names this device to the issuer; the issuer may show it to its user.
+    pub fn start_pairing(self: &Arc<Self>, invite: &str, label: Option<String>) -> Result<PairingId> {
+        let invite = Invite::from_str(invite).context("reading the invite")?;
+        let id = self
+            .next_pairing
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let state = Arc::new(Mutex::new(PairingState::Starting));
+        self.pairings
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(id, state.clone());
+
+        let service = self.clone();
+        // Detached: the pairing finishes on its own, and the caller polls.
+        runtime()?.spawn(async move {
+            let outcome = service.run_pairing(invite, label, &state).await;
+            let next = match outcome {
+                Ok(next) => next,
+                Err(error) => PairingState::Failed {
+                    error: format!("{error:#}"),
+                },
+            };
+            *state.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = next;
+        });
+
+        Ok(id)
+    }
+
+    /// Where pairing `id` stands now.
+    pub fn pairing_state(&self, id: PairingId) -> Result<PairingState> {
+        let pairings = self
+            .pairings
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let state = pairings
+            .get(&id)
+            .ok_or_else(|| anyhow!("no pairing with id {id}"))?;
+        Ok(state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone())
+    }
+
+    /// The whole pairing, from the invite to saving the issuer. Runs on the
+    /// iroh runtime and reports progress through `state`.
+    async fn run_pairing(
+        &self,
+        invite: Invite,
+        label: Option<String>,
+        state: &Mutex<PairingState>,
+    ) -> Result<PairingState> {
+        let issuer = invite.ticket.endpoint_addr().id;
+        let claim: Claim = self
+            .joined
+            .claim(None, issuer)
+            .context("reading joined issuers")?
+            .map_err(|error| anyhow!("{error}"))?;
+
+        // A dedicated endpoint: pairing closes the endpoint it is given, and
+        // the shared one must keep serving tunnels.
+        let endpoint = self
+            .network
+            .endpoint_builder(self.secret.clone())
+            .bind()
+            .await
+            .context("binding an endpoint for pairing")?;
+        let joining = match Joining::new(endpoint, invite, label) {
+            Ok(joining) => joining,
+            Err(error) => return Ok(PairingState::Failed { error: error.to_string() }),
+        };
+
+        let words = joining.sas().words();
+        *state.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) =
+            PairingState::Waiting { words, issuer };
+
+        match joining.finish().await {
+            Ok(pair::Joined::Accepted(ticket)) => {
+                let (issuer, _) = self
+                    .joined
+                    .save(claim, &ticket)
+                    .map_err(|error| anyhow!("{error}"))?;
+                Ok(PairingState::Accepted {
+                    name: issuer.name.to_string(),
+                })
+            }
+            Ok(pair::Joined::Rejected(reason)) => Ok(PairingState::Rejected {
+                reason: reason.map(|reason| format!("{reason:?}")),
+            }),
+            Err(error @ JoinError::OwnInvite { .. }) => Err(error.into()),
+            Err(error) => Ok(PairingState::Failed {
+                error: error.to_string(),
+            }),
+        }
     }
 
     /// Each joined issuer with its connection state. An issuer that has not
