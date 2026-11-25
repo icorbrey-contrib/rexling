@@ -29,6 +29,15 @@ def download(url, expected, path):
     temporary.replace(path)
 
 
+def rust_target_installed(cargo, env):
+    # Toolchains without rustup (such as the Nix development shell) ship the target preinstalled.
+    rustc = Path(cargo).with_name("rustc")
+    if not rustc.exists():
+        return False
+    sysroot = subprocess.run([str(rustc), "--print", "sysroot"], cwd=ROOT, env=env, check=True, capture_output=True, text=True).stdout.strip()
+    return (Path(sysroot) / "lib/rustlib" / TARGET / "lib").is_dir()
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--host-test", action="store_true")
@@ -95,7 +104,8 @@ def main():
     if args.host_test:
         run([cargo, "test", "--locked", "--workspace", "--all-features", "--manifest-path", ROOT / "Cargo.toml"], cwd=ROOT, env=env)
         return
-    run([rustup, "target", "add", TARGET], env=env)
+    if not rust_target_installed(cargo, env):
+        run([rustup, "target", "add", TARGET], env=env)
     run([cargo, "build", "--locked", "--release", "--target", TARGET, "--manifest-path", ROOT / "Cargo.toml", "-p", "rexling-jni"], cwd=ROOT, env=env)
     destination = ANDROID / "app/src/main/jniLibs/arm64-v8a"
     destination.mkdir(parents=True, exist_ok=True)

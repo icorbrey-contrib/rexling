@@ -18,8 +18,13 @@ fun gitOutput(vararg args: String): String = runCatching {
         isIgnoreExitValue=true
     }.standardOutput.asText.get().trim()
 }.getOrDefault("")
-val revision=gitOutput("rev-parse","--short=10","HEAD").takeIf {it.matches(Regex("[0-9a-f]{7,40}"))} ?: "unknown"
-val modified=gitOutput("status","--porcelain","--untracked-files=no").isNotBlank()
+// Builds without a Git checkout (such as Nix) pass the revision in, with "-dirty" marking local changes.
+val revisionOverride=providers.environmentVariable("REXLING_GIT_REVISION").orNull
+val revision=(revisionOverride?.removeSuffix("-dirty") ?: gitOutput("rev-parse","--short=10","HEAD")).takeIf {it.matches(Regex("[0-9a-f]{7,40}"))} ?: "unknown"
+val modified=revisionOverride?.endsWith("-dirty") ?: gitOutput("status","--porcelain","--untracked-files=no").isNotBlank()
+// Hermetic builds (such as Nix) supply prebuilt native libraries and sign the APK in a later step.
+val prebuiltJniLibs=providers.gradleProperty("rexling.prebuiltJniLibs").orNull
+val unsignedRelease=providers.gradleProperty("rexling.unsignedRelease").orNull=="true"
 
 android {
     namespace = "dev.shulhi.rex"
@@ -42,6 +47,7 @@ android {
         targetCompatibility = JavaVersion.VERSION_17
     }
     packaging { jniLibs { useLegacyPackaging = false } }
+    if(prebuiltJniLibs!=null) sourceSets.getByName("main").jniLibs.setSrcDirs(listOf(prebuiltJniLibs))
     buildTypes {
         getByName("debug") {
             // A disposable package for on-device rendering tests; never touches the installed app's settings.
@@ -49,7 +55,7 @@ android {
         }
         release {
             // Preserve the installed prototype identity for local release upgrades.
-            signingConfig=signingConfigs.getByName("debug")
+            signingConfig=if(unsignedRelease) null else signingConfigs.getByName("debug")
             isMinifyEnabled = true
             isShrinkResources = true
             proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
@@ -98,7 +104,7 @@ val buildRust by tasks.registering(Exec::class) {
     inputs.file(rootProject.file("scripts/build_native.py"))
     outputs.dir(project.file("src/main/jniLibs/arm64-v8a"))
 }
-tasks.named("preBuild").configure { dependsOn(buildRust) }
+if(prebuiltJniLibs==null) tasks.named("preBuild").configure { dependsOn(buildRust) }
 
 // Use the same configuration values as About, never the checkout at copy time.
 tasks.register("shareRelease") {

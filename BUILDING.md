@@ -29,9 +29,8 @@ On Linux set `ANDROID_HOME` and `JAVA_HOME` explicitly. The native helper also
 accepts `ANDROID_NDK_HOME`. SDK paths in `rexling-android/local.properties` are
 machine-local and ignored by Git. No toolchain or SDK installation is committed.
 
-The wrapper selects Android Studio's bundled JDK on macOS and changes into the
-Android project. To select another JDK on macOS, run `./gradlew` directly from
-`rexling-android/` with the desired `JAVA_HOME`.
+The wrapper changes into the Android project. On macOS it selects Android
+Studio's bundled JDK when `JAVA_HOME` is not set; set `JAVA_HOME` to use another JDK.
 
 ## Android APK
 
@@ -66,6 +65,8 @@ The visible app version uses the build's UTC date (`YYYY.MM.DD`). **⋮ → Pref
 Rexling** shows that version, Android's numeric build code, build type and Git
 revision, with **Copy build info** for bug reports. Tracked local edits are marked
 as local changes; source archives without Git show `unknown` for the revision.
+To supply the revision without Git, set `REXLING_GIT_REVISION` to the commit hash;
+a `-dirty` suffix marks local changes.
 Increase `versionCode` in `rexling-android/app/build.gradle.kts` for each distributed
 update, including multiple releases on the same day. For reproducible version
 dates, set `SOURCE_DATE_EPOCH` to the release's Unix timestamp before building.
@@ -85,6 +86,53 @@ adb -s <serial> install -r rexling-android/app/build/outputs/apk/release/app-rel
 
 Keep Tailscale active on the device when accessing a private tailnet Rex server.
 Building the APK does not contact or change a Rex server.
+
+## Nix
+
+With Nix and flakes enabled, build the unsigned arm64 release APK without installing
+any other toolchain:
+
+```sh
+nix build .#rexling-apk
+```
+
+The APK is `result/rexling-arm64-release-unsigned.apk`. Sign it with `apksigner` before
+installing it. The build uses only the Nix store: it writes nothing to the checkout or
+the home directory, and needs no Android Studio or SDK installation. It runs on Apple
+Silicon macOS and x86_64 Linux.
+
+Nix builds each native library as its own package (`.#libghostty-vt`,
+`.#rexling-network` and `.#rexling-jni`), with the same compiler flags as the native
+helper. Gradle then packages these libraries offline instead of running the helper.
+The Ghostty revision and NDK version come from `rexling-core/native/ghostty-source.json`,
+and the Gradle version and checksum come from the Gradle wrapper. Zig, Go, Rust and
+the JDK come from nixpkgs, so their patch versions can differ from the helper's. About shows the flake's commit, and the
+version date is that commit's date. Uncommitted changes show as local changes.
+
+`nix develop` opens a shell with Rust (including the Android target), Go, Zig,
+Python, JDK 25 and the Android SDK with the NDK. The commands in this guide work in
+that shell. Gradle and the native helper still use their own caches there.
+
+The flake locks every download. Update the locks as follows:
+
+- `flake.lock` pins nixpkgs, the Rust toolchain and Ghostty. Run `nix flake update`.
+  When you change the Ghostty revision in `ghostty-source.json`, change the `ghostty`
+  input in `flake.nix` to match. The evaluation fails if the two differ.
+- Ghostty's Zig packages come from Ghostty's own `deps/packages.nix`. No local lock
+  is necessary.
+- Rust crates come from `rexling-core/Cargo.lock`. No local lock is necessary.
+- After you change `rexling-network/go.mod` or `go.sum`, set `vendorHash` in
+  `nix/rexling-network.nix` to `""`, run `nix build .#rexling-network`, and copy the
+  hash that Nix reports.
+- After you change Gradle plugins or dependencies, run this command from the
+  repository root to rewrite `nix/gradle-deps.json`:
+
+  ```sh
+  $(nix build --no-link --print-out-paths .#rexling-apk.mitmCache.updateScript)
+  ```
+
+  The script runs the Gradle build through a recording proxy and downloads the
+  dependencies from Google Maven and Maven Central.
 
 ## Rust probe without Android or Ghostty
 
