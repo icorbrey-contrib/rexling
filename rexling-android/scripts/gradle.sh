@@ -1,7 +1,7 @@
 #!/bin/sh
 set -eu
 REX_PROJECT_ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
-if [ -d "/Applications/Android Studio.app/Contents/jbr/Contents/Home" ]; then
+if [ -z "${JAVA_HOME:-}" ] && [ -d "/Applications/Android Studio.app/Contents/jbr/Contents/Home" ]; then
   export JAVA_HOME="/Applications/Android Studio.app/Contents/jbr/Contents/Home"
 fi
 if [ -z "${ANDROID_HOME:-}" ] && [ -d "$HOME/Library/Android/sdk" ]; then

@@ -29,9 +29,8 @@ On Linux set `ANDROID_HOME` and `JAVA_HOME` explicitly. The native helper also
 accepts `ANDROID_NDK_HOME`. SDK paths in `rexling-android/local.properties` are
 machine-local and ignored by Git. No toolchain or SDK installation is committed.
 
-The wrapper selects Android Studio's bundled JDK on macOS and changes into the
-Android project. To select another JDK on macOS, run `./gradlew` directly from
-`rexling-android/` with the desired `JAVA_HOME`.
+The wrapper changes into the Android project. On macOS it selects Android
+Studio's bundled JDK when `JAVA_HOME` is not set; set `JAVA_HOME` to use another JDK.
 
 ## Android APK
 
