@@ -65,6 +65,8 @@ The visible app version uses the build's UTC date (`YYYY.MM.DD`). **⋮ → Pref
 Rexling** shows that version, Android's numeric build code, build type and Git
 revision, with **Copy build info** for bug reports. Tracked local edits are marked
 as local changes; source archives without Git show `unknown` for the revision.
+To supply the revision without Git, set `REXLING_GIT_REVISION` to the commit hash;
+a `-dirty` suffix marks local changes.
 Increase `versionCode` in `rexling-android/app/build.gradle.kts` for each distributed
 update, including multiple releases on the same day. For reproducible version
 dates, set `SOURCE_DATE_EPOCH` to the release's Unix timestamp before building.

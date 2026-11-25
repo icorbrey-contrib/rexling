@@ -18,8 +18,10 @@ fun gitOutput(vararg args: String): String = runCatching {
         isIgnoreExitValue=true
     }.standardOutput.asText.get().trim()
 }.getOrDefault("")
-val revision=gitOutput("rev-parse","--short=10","HEAD").takeIf {it.matches(Regex("[0-9a-f]{7,40}"))} ?: "unknown"
-val modified=gitOutput("status","--porcelain","--untracked-files=no").isNotBlank()
+// Builds without a Git checkout (such as Nix) pass the revision in, with "-dirty" marking local changes.
+val revisionOverride=providers.environmentVariable("REXLING_GIT_REVISION").orNull
+val revision=(revisionOverride?.removeSuffix("-dirty") ?: gitOutput("rev-parse","--short=10","HEAD")).takeIf {it.matches(Regex("[0-9a-f]{7,40}"))} ?: "unknown"
+val modified=revisionOverride?.endsWith("-dirty") ?: gitOutput("status","--porcelain","--untracked-files=no").isNotBlank()
 
 android {
     namespace = "dev.shulhi.rex"
